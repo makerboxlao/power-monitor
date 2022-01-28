@@ -1,9 +1,5 @@
-#include <PZEM004Tv30.h>      // PZEM 004 v3.0 Library
-#include <SoftwareSerial.h>   // Software TX/RX 
-#include <ESP8266WiFi.h>      // WiFI library
-#include <MySQL_Connection.h> // MySQL library
-#include <MySQL_Cursor.h>     // MySQL query library
 #include "config.h"           // Program configuration
+#include "includes.h"         // Main includes
 
 //
 // Verify basic configuration has been configured
@@ -35,12 +31,6 @@
 #define MYSQL_PASS ""
 #endif
 
-// MAC Address for WiFi device
-// https://miniwebtool.com/mac-address-generator/
-// @TODO
-// This may not be required and can be remove later
-byte mac_addr[] = { 0x66, 0x44, 0x26, 0xAC, 0x61, 0x47 };
-
 //
 // MySQL Connection information
 //
@@ -58,7 +48,7 @@ MySQL_Connection conn( (Client *) &client );
 SoftwareSerial pzemSWSerial( D5, D2 ); // RX, TX ports for pzem
 
 int const PZEM_COUNT = 3;       // Number of PZEM units
-int const PZEM_ADDR = 0x45;     // Starting PZEM address (0x45, 0x46, 0x47)
+int const PZEM_ADDR = 0x45;     // Starting PZEM address
 PZEM004Tv30 pzems[PZEM_COUNT];  // Initialize the PZEM
 
 //
@@ -79,8 +69,7 @@ void setup()
   WiFi.begin( WIFI_SSID, WIFI_PASS );
   
   // Connecting to WiFi...
-  Serial.print( "Connecting to " );
-  Serial.print( WIFI_SSID );
+  Serial.printf( "Connecting to %s\n", WIFI_SSID );
   
   // Loop continuously while WiFi is not connected
   while( WiFi.status() != WL_CONNECTED )
@@ -91,13 +80,16 @@ void setup()
 
   // Connected to WiFi
   Serial.println();
-  Serial.print( "Connected! IP address: ");
-  Serial.println( WiFi.localIP() );
+  Serial.printf( "Connected! IP address: %s\n", WiFi.localIP().toString().c_str() );
 
-  // Update MAC Address of WiFi
-  // @TODO
-  // Check to see if this is required or not
-  WiFi.macAddress( mac_addr );
+  DateTime.setServer( "ntp.laodc.com" );
+  DateTime.setTimeZone( "UTC" );
+  DateTime.begin();
+
+  if( !DateTime.isTimeValid() )
+    Serial.println( "Failed to get time from server.");
+  else
+    Serial.printf( "Date Now is %s\n", DateTime.toISOString().c_str() );
 
   // Connect to MySQL Database Server
   checkDatabaseConnection();
@@ -106,33 +98,33 @@ void setup()
   for( int i = 0; i < PZEM_COUNT; i++ )
   {
     uint8_t addr = PZEM_ADDR + i;
-    Serial.print( "Connecting to PZEM (0x" );
-    Serial.print( addr, HEX );
-    Serial.println( ")" );
+    Serial.printf( "Connecting to PZEM (0x%x)\n", addr );
     
     pzems[i] = PZEM004Tv30( pzemSWSerial, addr );
 
-    Serial.print( "Connected PZEM ID: (0x" );
-    Serial.print( pzems[i].readAddress(), HEX );
-    Serial.println( ")" );
+    Serial.printf( "Connected PZEM ID: (0x%x)\n", pzems[i].readAddress() );
   }
   
   Serial.println();
 }
 
-typedef struct {
-  int phase;
-  float voltage;
-  float current;
-  float power;
-  float energy;
-  float frequency;
-  float pf;
-} pzemData;
+StackArray<pzemStruct*> pzemData;
 
 void loop()
 {
   int status = checkDatabaseConnection();
+
+  // check to see if we have pending power usage in the queue
+  if( true == status && pzemData.count() > 0 )
+  {
+    Serial.println( "Backlog of data detected. attempting to backfill data to Database..." );
+    while( !pzemData.isEmpty() )
+    {
+      pzemStruct *record = pzemData.pop();
+      addRecord( record );
+      Serial.printf( "Backlog dated %s added successfully.\n", record->timestamp.toISOString().c_str() );
+    }
+  }
   
   for( int i = 0; i < PZEM_COUNT; i++ )
   {
@@ -166,24 +158,30 @@ void loop()
     if( isnan( pf ) )
       pf = -1;
 
+    pzemStruct *data = new pzemStruct();
+    data->phase = i + 1;
+    data->voltage = voltage;
+    data->current = current;
+    data->power = power;
+    data->energy = energy;
+    data->frequency = frequency;
+    data->pf = pf;
+    data->timestamp = DateTime;
+
     if( false == status )
     {
       // As we are not connected to the MySQL Database
       // we are going to store the information until it becomes available again
-      // @TODO
-      // Detect if we are about to run out of memory and flush out old data
-      
+      pzemData.unshift( data );
+
+      Serial.println( "Storing data into memoty while MySQL Database connection is down." );
+      Serial.println( "----------" );
     }
     else
     {
-      // Prepare SQL statement to populate database
-      char INSERT_SQL[255];
-      sprintf( INSERT_SQL, "INSERT INTO mbl_power_usage.mdb_power(phase, voltage, current, power, energy, frequency, pf) VALUES (%d, %.02f, %.02f, %.02f, %.03f, %.01f, %.02f)", i + 1, voltage, current, power, energy, frequency, pf );
-  
-      // Execute the SQL statement
-      MySQL_Cursor *cur_mem = new MySQL_Cursor( &conn );
-      cur_mem->execute( INSERT_SQL );
-      delete cur_mem;
+      data->timestamp = 0;
+      addRecord( data );
+      delete data;
       
       Serial.println( "Uploaded data Successfully." );
       Serial.println( "----------" );
@@ -194,6 +192,42 @@ void loop()
   // we only want to update once every minute
   Serial.println( "Waiting for next polling..." );
   delay( delay_timer );
+}
+
+bool addRecord( pzemStruct *record )
+{
+  // Prepare SQL statement to populate database
+  char INSERT_SQL[255];
+
+  // Check to see if a timestamp was set (backlog)
+  // if so, prepare the SQL statement to include it
+  char timestamp[255];
+  sprintf( timestamp, "" );
+  if( record->timestamp != 0 )
+    sprintf( timestamp, "%s%s%s", ", \"", record->timestamp.toISOString().c_str(), "\"" );
+
+  sprintf(
+    INSERT_SQL,
+    "INSERT INTO mbl_power_usage.mdb_power"
+    "( phase, voltage, current, power, energy, frequency, pf%s ) "
+    "VALUES "
+    "( %d, %f, %f, %f, %f, %f, %f%s )",
+    ( record->timestamp != 0 ) ? ", timestamp" : "",
+    record->phase,
+    record->voltage,
+    record->current,
+    record->power,
+    record->energy,
+    record->frequency,
+    record->pf,
+    timestamp
+  );
+
+  // Execute the SQL statement
+  MySQL_Cursor *cur_mem = new MySQL_Cursor( &conn );
+  cur_mem->execute( INSERT_SQL );
+  delete cur_mem;
+  return true;
 }
 
 // Function to check if still connected to database or not
@@ -229,11 +263,7 @@ bool checkDatabaseConnection()
         retry_count = 0;
         return false;
       }
-      Serial.print( "Connection failed, trying again... (" );
-      Serial.print( retry_count );
-      Serial.print( " of " );
-      Serial.print( connection_retries );
-      Serial.println( ")" );
+      Serial.println( "Connection failed, trying again..." );
       delay( 100 );
       return checkDatabaseConnection();
     }
