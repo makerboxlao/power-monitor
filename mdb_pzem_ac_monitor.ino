@@ -41,11 +41,11 @@ MySQL_Connection conn( (Client *) &client );
 //
 // PZEM Connection information
 //
-// Pin D5 is used for (arduino) RX <- TX (pxem)
-// Pin D2 is used for (arduino) TX -> RX (pzem)
+// Pin D2 is used for (arduino) RX <- TX (pxem)
+// Pin D5 is used for (arduino) TX -> RX (pzem)
 //
 
-SoftwareSerial pzemSWSerial( D5, D2 ); // RX, TX ports for pzem
+SoftwareSerial pzemSWSerial( D2, D5 ); // RX, TX ports for pzem
 
 int const PZEM_COUNT = 3;       // Number of PZEM units
 int const PZEM_ADDR = 0x45;     // Starting PZEM address
@@ -123,6 +123,7 @@ void loop()
       pzemStruct *record = pzemData.pop();
       addRecord( record );
       Serial.printf( "Backlog dated %s added successfully.\n", record->timestamp.toISOString().c_str() );
+      delay( 25 );
     }
   }
   
